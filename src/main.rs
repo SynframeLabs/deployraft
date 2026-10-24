@@ -4,9 +4,12 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
-use std::os::fd::AsFd;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const HELP: &str = "Deployraft - run a deployment over SSH
 
@@ -14,7 +17,7 @@ Usage: deployraft [--config PATH] [--verbose] [--] APP
 
 Options:
   --config PATH  Configuration file (default: ~/.config/deployraft/config.toml)
-  --verbose      Print the full command (may expose secrets)
+  --verbose      Print progress, output and the full command (may expose secrets)
   --             End options
   -h, --help     Show this help
 
@@ -59,6 +62,76 @@ fn default_port() -> u16 {
     22
 }
 
+struct LogOutput {
+    file: fs::File,
+    verbose: bool,
+}
+
+impl Write for LogOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file.write_all(bytes)?;
+
+        if self.verbose {
+            io::stdout().write_all(bytes)?;
+        }
+
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+
+        if self.verbose {
+            io::stdout().flush()?;
+        }
+
+        Ok(())
+    }
+}
+
+fn create_log(app_name: &str, verbose: bool) -> Result<LogOutput, Box<dyn Error>> {
+    let base = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .map(|home| home.join(".local/state"))
+        })
+        .ok_or("cannot locate the log directory. Set an absolute HOME or XDG_STATE_HOME")?;
+    let directory = base.join("deployraft/logs");
+    fs::create_dir_all(&directory)?;
+    let name: String = app_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect();
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let path = directory.join(format!(
+        "{name}-{}-{:09}-{}.log",
+        timestamp.as_secs(),
+        timestamp.subsec_nanos(),
+        std::process::id()
+    ));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("cannot create log {}: {error}", path.display()))?;
+    let mut output = LogOutput { file, verbose };
+    writeln!(output, "Log: {}", path.display())?;
+    writeln!(output, "Started: {} (Unix seconds)", timestamp.as_secs())?;
+    Ok(output)
+}
+
 fn default_config_path() -> Result<PathBuf, String> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -78,14 +151,13 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let _ = writeln!(io::stdout(), "FAILURE: {error}");
+            let _ = writeln!(io::stderr(), "FAILURE: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let mut output = io::stdout();
     let mut args = env::args_os().skip(1);
     let mut path = None;
     let mut app_name = None;
@@ -94,8 +166,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     while let Some(arg) = args.next() {
         if parse_options && (arg == "-h" || arg == "--help") {
-            write!(output, "{HELP}")?;
-            output.flush()?;
+            write!(io::stdout(), "{HELP}")?;
+            io::stdout().flush()?;
             return Ok(());
         }
 
@@ -145,6 +217,28 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     validate(server, app)?;
 
+    let mut output = create_log(&app_name, verbose)?;
+    let result = deploy(&app_name, server, app, &mut output);
+
+    if let Err(error) = &result {
+        writeln!(output, "FAILURE: {error}")?;
+    }
+
+    writeln!(
+        output,
+        "Finished: {} (Unix seconds)",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
+    )?;
+    output.flush()?;
+    result
+}
+
+fn deploy(
+    app_name: &str,
+    server: &Server,
+    app: &App,
+    output: &mut LogOutput,
+) -> Result<(), Box<dyn Error>> {
     writeln!(output, "Application: {app_name}")?;
     writeln!(
         output,
@@ -153,7 +247,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     writeln!(output, "Directory: {}", app.directory)?;
 
-    if verbose {
+    if output.verbose {
         writeln!(
             output,
             "WARNING: the full command below may contain secrets."
@@ -183,7 +277,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     output.flush()?;
-    execute(server, &remote_script(app))?;
+    execute(server, &remote_script(app), output)?;
 
     if app.at.is_some() {
         writeln!(
@@ -299,7 +393,7 @@ printf '%s\n' {deployment} | at -v {requested}
     )
 }
 
-fn execute(server: &Server, script: &str) -> Result<(), String> {
+fn execute(server: &Server, script: &str, output: &mut LogOutput) -> Result<(), Box<dyn Error>> {
     let mut ssh = Command::new("ssh");
     ssh.args(["-T", "-p", &server.port.to_string(), "-l", &server.user]);
     ssh.args([
@@ -354,28 +448,39 @@ fn execute(server: &Server, script: &str) -> Result<(), String> {
         }
     }
 
-    let stdout = io::stdout()
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|error| format!("cannot forward SSH diagnostics: {error}"))?;
-    let status = ssh
+    let reader = if output.verbose {
+        let (reader, writer) = UnixStream::pair()?;
+        ssh.stdout(Stdio::from(OwnedFd::from(writer.try_clone()?)))
+            .stderr(Stdio::from(OwnedFd::from(writer)));
+        Some(reader)
+    } else {
+        ssh.stdout(Stdio::from(output.file.try_clone()?))
+            .stderr(Stdio::from(output.file.try_clone()?));
+        None
+    };
+    let mut child = ssh
         .arg("--")
         .arg(&server.host)
         .arg(format!("/bin/sh -c {}", shell_quote(script)))
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::from(stdout))
-        .status()
+        .spawn()
         .map_err(|error| format!("cannot start ssh: {error}"))?;
+    drop(ssh);
+    let copied = match reader {
+        Some(mut reader) => io::copy(&mut reader, output).map(|_| ()),
+        None => Ok(()),
+    };
+    let status = child.wait()?;
+    copied?;
 
     if status.code().is_none() || status.code() == Some(255) {
         return Err(format!(
             "SSH ended without a confirmed result ({status}). The remote operation may already have started or completed. Check the server state and, for scheduled jobs, atq before retrying"
-        ));
+        ).into());
     }
 
     if !status.success() {
-        return Err(format!("SSH or remote operation failed ({status})"));
+        return Err(format!("SSH or remote operation failed ({status})").into());
     }
 
     Ok(())
